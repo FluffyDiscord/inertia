@@ -2,10 +2,38 @@ import modal from './modal'
 import debounce from './debounce'
 import { hasFiles } from './files'
 import { objectToFormData } from './formData'
-import { default as Axios, AxiosResponse } from 'axios'
+import {default as Axios, AxiosResponse, AxiosPromise} from 'axios'
 import { hrefToUrl, mergeDataIntoQueryString, urlWithoutHash } from './url'
-import { ActiveVisit, GlobalEvent, GlobalEventNames, GlobalEventResult, LocationVisit, Method, Page, PageHandler, PageResolver, PendingVisit, PreserveStateOption, RequestPayload, VisitId, VisitParams, VisitOptions } from './types'
-import { fireBeforeEvent, fireErrorEvent, fireExceptionEvent, fireFinishEvent, fireInvalidEvent, fireNavigateEvent, fireProgressEvent, fireStartEvent, fireSuccessEvent } from './events'
+import {
+  ActiveVisit,
+  GlobalEvent,
+  GlobalEventNames,
+  GlobalEventResult,
+  LocationVisit,
+  Method,
+  Page,
+  PageHandler,
+  PageResolver,
+  PendingVisit,
+  PreserveStateOption,
+  RequestPayload,
+  VisitId,
+  VisitParams,
+  VisitOptions,
+  GlobalEventCallback,
+} from './types'
+import {
+  fireBeforeEvent,
+  fireErrorEvent,
+  fireExceptionEvent,
+  fireFinishEvent,
+  fireInvalidEvent,
+  fireNavigateEvent,
+  firePrefetchStartEvent,
+  fireProgressEvent,
+  fireStartEvent,
+  fireSuccessEvent,
+} from './events'
 
 const isServer = typeof window === 'undefined'
 
@@ -16,6 +44,7 @@ export class Router {
   protected visitOptions!: VisitOptions
   protected activeVisit?: ActiveVisit
   protected visitId: VisitId = null
+  protected prefetchCache = new Map<string, { request: AxiosPromise, timeout: ReturnType<typeof setTimeout>, activeVisit: ActiveVisit }>()
 
   public init({
     initialPage,
@@ -205,6 +234,54 @@ export class Router {
       return value
     }
   }
+  
+  protected activeVisitIsCancellable(visit: PendingVisit): boolean
+  {
+    if(!this.activeVisit) {
+      return false
+    }
+    
+    if(visit.prefetchTimeout && this.activeVisit.prefetchTimeout) {
+      return visit.url.toString() !== this.activeVisit.url.toString()
+    }
+    
+    return false
+  }
+  
+  protected async processVisitResponse(
+    pageResponse: Page,
+    visit: PendingVisit,
+    visitId: VisitId,
+    onError: GlobalEventCallback<'error'>,
+    onSuccess: GlobalEventCallback<'success'>,
+  ): Promise<unknown> {
+    if (visit.only.length && pageResponse.component === this.page.component) {
+      pageResponse.props = { ...this.page.props, ...pageResponse.props }
+    }
+    visit.preserveScroll = this.resolvePreserveOption(visit.preserveScroll, pageResponse) as boolean
+    visit.preserveState = this.resolvePreserveOption(visit.preserveState, pageResponse)
+    if (visit.preserveState && window.history.state?.rememberedState && pageResponse.component === this.page.component) {
+      pageResponse.rememberedState = window.history.state.rememberedState
+    }
+    const requestUrl = visit.url
+    const responseUrl = hrefToUrl(pageResponse.url)
+    if (requestUrl.hash && !responseUrl.hash && urlWithoutHash(requestUrl).href === responseUrl.href) {
+      responseUrl.hash = requestUrl.hash
+      pageResponse.url = responseUrl.href
+    }
+    
+    const {replace, preserveScroll, preserveState} = visit
+    await this.setPage(pageResponse, { visitId, replace, preserveScroll, preserveState } )
+  
+    const errors = this.page.props.errors || {}
+    if (Object.keys(errors).length > 0) {
+      const scopedErrors = visit.errorBag ? (errors[visit.errorBag] ? errors[visit.errorBag] : {}) : errors
+      fireErrorEvent(scopedErrors)
+      return onError(scopedErrors)
+    }
+    fireSuccessEvent(this.page)
+    return onSuccess(this.page)
+  }
 
   public visit(href: string|URL, params: VisitParams = {}): void {
     const options: Required<VisitParams> = {
@@ -218,9 +295,11 @@ export class Router {
       errorBag: '',
       forceFormData: false,
       queryStringArrayFormat: 'brackets',
+      prefetchTimeout: null,
       onCancelToken: () => {},
       onBefore: () => {},
       onStart: () => {},
+      onPrefetchStart: () => {},
       onProgress: () => {},
       onFinish: () => {},
       onCancel: () => {},
@@ -228,13 +307,17 @@ export class Router {
       onError: () => {},
       ... params,
     }
+  
+    if(options.prefetchTimeout && options.method !== Method.GET) {
+      throw new Error(`"prefetch" can be used only with "${Method.GET}" method`)
+    }
 
     let url = typeof href === 'string' ? hrefToUrl(href) : href
 
     const prepared = this.visitOptions(options, url) || options
 
-    const { method, replace, only, headers, errorBag, forceFormData, queryStringArrayFormat, onCancelToken, onBefore, onStart, onProgress, onFinish, onCancel, onSuccess, onError } = prepared
-    let { data, preserveScroll, preserveState } = prepared
+    const { method, replace, only, headers, errorBag, forceFormData, queryStringArrayFormat, onCancelToken, onBefore, onStart, onProgress, onFinish, onCancel, onSuccess, onError, prefetchTimeout, preserveScroll, preserveState, onPrefetchStart } = prepared
+    let { data } = prepared
 
     if ((hasFiles(data) || forceFormData) && !(data instanceof FormData)) {
       data = objectToFormData(data)
@@ -258,23 +341,30 @@ export class Router {
       errorBag,
       forceFormData,
       queryStringArrayFormat,
+      prefetchTimeout,
       cancelled: false,
       completed: false,
       interrupted: false,
+    }
+    
+    const prefetchCacheKey = visit.url.toString()
+    const inPrefetchCache = this.prefetchCache.has(prefetchCacheKey)
+    if(inPrefetchCache && prefetchCacheKey === this.activeVisit?.url.toString() && visit.prefetchTimeout && this.activeVisit?.prefetchTimeout) {
+      return
     }
 
     if (onBefore(visit) === false || !fireBeforeEvent(visit)) {
       return
     }
 
-    if (this.activeVisit) {
-      this.cancelVisit(this.activeVisit, { interrupted: true })
+    if (this.activeVisitIsCancellable(visit)) {
+      this.cancelVisit(this.activeVisit as ActiveVisit, { interrupted: true })
     }
 
     this.saveScrollPositions()
 
     const visitId = this.createVisitId()
-    this.activeVisit = { ...visit, onCancelToken, onBefore, onStart, onProgress, onFinish, onCancel, onSuccess, onError, queryStringArrayFormat, cancelToken: Axios.CancelToken.source() }
+    this.activeVisit = { ...visit, onCancelToken, onBefore, onStart, onProgress, onFinish, onCancel, onSuccess, onError, queryStringArrayFormat, cancelToken: Axios.CancelToken.source(), onPrefetchStart }
 
     onCancelToken({
       cancel: () => {
@@ -284,15 +374,41 @@ export class Router {
       },
     })
 
-    fireStartEvent(visit)
-    onStart(visit)
+    if(visit.prefetchTimeout) {
+      firePrefetchStartEvent(visit)
+      onPrefetchStart(visit)
+    } else {
+      fireStartEvent(visit)
+      onStart(visit)
+    }
+  
+    if(inPrefetchCache) {
+      const cachedPrefetch = this.prefetchCache.get(prefetchCacheKey)
+      if(cachedPrefetch !== undefined) {
+        this.processVisitRequest(
+          cachedPrefetch.request,
+          visit,
+          visitId,
+          onError,
+          onSuccess,
+        ).finally(() => {
+          if(cachedPrefetch.timeout) {
+            clearTimeout(cachedPrefetch.timeout)
+          }
+          
+          this.prefetchCache.delete(prefetchCacheKey)
+        })
+      }
+      
+      return
+    }
 
-    Axios({
+    const request = Axios({
       method,
       url: urlWithoutHash(url).href,
       data: method === Method.GET ? {} : data,
       params: method === Method.GET ? data : {},
-      cancelToken: this.activeVisit.cancelToken.token,
+      cancelToken: this.activeVisit?.cancelToken.token,
       headers: {
         ...headers,
         Accept: 'text/html, application/xhtml+xml',
@@ -304,6 +420,7 @@ export class Router {
         } : {}),
         ...(errorBag && errorBag.length ? { 'X-Inertia-Error-Bag': errorBag } : {}),
         ...(this.page.version ? { 'X-Inertia-Version': this.page.version } : {}),
+        ...(visit.prefetchTimeout ? { 'X-Inertia-Prefetch': true } : {}),
       },
       onUploadProgress: progress => {
         if (data instanceof FormData) {
@@ -312,46 +429,90 @@ export class Router {
           onProgress(progress)
         }
       },
-    }).then(response => {
+    })
+  
+    if(visit.prefetchTimeout) {
+      this.prefetchCache.set(prefetchCacheKey, {
+        request,
+        activeVisit: this.activeVisit,
+        timeout: setTimeout(() =>  {
+          if(this.prefetchCache.has(prefetchCacheKey)) {
+            this.prefetchCache.delete(prefetchCacheKey)
+          }
+        }, visit.prefetchTimeout),
+      })
+  
+      return
+    }
+    
+    this.processVisitRequest(
+      request,
+      visit,
+      visitId,
+      onError,
+      onSuccess,
+    )
+  }
+  
+  private cancelCachedPrefetch(cacheKey: string): void
+  {
+    const item = this.prefetchCache.get(cacheKey)
+    if(!item) {
+      return
+    }
+    
+    if(item.timeout) {
+      clearTimeout(item.timeout)
+    }
+  
+    if(item.activeVisit) {
+      this.cancelVisit(item.activeVisit, {cancelled: true})
+    }
+  
+    this.prefetchCache.delete(cacheKey)
+  }
+  
+  public cancelPrefetch(url: URL|string|undefined = undefined): void
+  {
+    if(url === undefined) {
+      this.prefetchCache.forEach((_, key) => {
+        this.cancelCachedPrefetch(key)
+      })
+    } else {
+      this.cancelCachedPrefetch(url instanceof URL ? url.toString() : url)
+    }
+  }
+  
+  protected processVisitRequest(
+    request: AxiosPromise,
+    visit: PendingVisit,
+    visitId: VisitId,
+    onError: GlobalEventCallback<'error'>,
+    onSuccess: GlobalEventCallback<'success'>,
+  ): Promise<unknown>
+  {
+    return request.then(response => {
       if (!this.isInertiaResponse(response)) {
         return Promise.reject({ response })
       }
-
-      const pageResponse: Page = response.data
-      if (only.length && pageResponse.component === this.page.component) {
-        pageResponse.props = { ...this.page.props, ...pageResponse.props }
-      }
-      preserveScroll = this.resolvePreserveOption(preserveScroll, pageResponse) as boolean
-      preserveState = this.resolvePreserveOption(preserveState, pageResponse)
-      if (preserveState && window.history.state?.rememberedState && pageResponse.component === this.page.component) {
-        pageResponse.rememberedState = window.history.state.rememberedState
-      }
-      const requestUrl = url
-      const responseUrl = hrefToUrl(pageResponse.url)
-      if (requestUrl.hash && !responseUrl.hash && urlWithoutHash(requestUrl).href === responseUrl.href) {
-        responseUrl.hash = requestUrl.hash
-        pageResponse.url = responseUrl.href
-      }
-      return this.setPage(pageResponse, { visitId, replace, preserveScroll, preserveState })
-    }).then(() => {
-      const errors = this.page.props.errors || {}
-      if (Object.keys(errors).length > 0) {
-        const scopedErrors = errorBag ? (errors[errorBag] ? errors[errorBag] : {}) : errors
-        fireErrorEvent(scopedErrors)
-        return onError(scopedErrors)
-      }
-      fireSuccessEvent(this.page)
-      return onSuccess(this.page)
+    
+      return this.processVisitResponse(
+        response.data,
+        visit,
+        visitId,
+        onError,
+        onSuccess,
+      )
     }).catch(error => {
       if (this.isInertiaResponse(error.response)) {
         return this.setPage(error.response.data, { visitId })
       } else if (this.isLocationVisitResponse(error.response)) {
         const locationUrl = hrefToUrl(error.response.headers['x-inertia-location'])
-        const requestUrl = url
+        const requestUrl = visit.url
         if (requestUrl.hash && !locationUrl.hash && urlWithoutHash(requestUrl).href === locationUrl.href) {
           locationUrl.hash = requestUrl.hash
         }
-        this.locationVisit(locationUrl, preserveScroll === true)
+        this.locationVisit(locationUrl, visit.preserveScroll === true)
       } else if (error.response) {
         if (fireInvalidEvent(error.response)) {
           modal.show(error.response.data)

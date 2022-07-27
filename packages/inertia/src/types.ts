@@ -64,6 +64,7 @@ export type Visit = {
   errorBag: string|null,
   forceFormData: boolean,
   queryStringArrayFormat: 'indices'|'brackets',
+  prefetchTimeout: number|null
 }
 
 export type GlobalEventsMap = {
@@ -75,6 +76,13 @@ export type GlobalEventsMap = {
     result: boolean|void,
   },
   start: {
+    parameters: [PendingVisit],
+    details: {
+      visit: PendingVisit,
+    },
+    result: void,
+  },
+  prefetchStart: {
     parameters: [PendingVisit],
     details: {
       visit: PendingVisit,
@@ -156,6 +164,7 @@ export type VisitParams = Partial<Visit & {
   onCancelToken: { ({ cancel }: { cancel: VoidFunction }): void },
   onBefore: GlobalEventCallback<'before'>,
   onStart: GlobalEventCallback<'start'>,
+  onPrefetchStart: GlobalEventCallback<'prefetchStart'>,
   onProgress: GlobalEventCallback<'progress'>,
   onFinish: GlobalEventCallback<'finish'>,
   onCancel: GlobalEventCallback<'cancel'>,
